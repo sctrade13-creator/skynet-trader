@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
+<meta name="theme-color" content="#07080f"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<title>SKYNET Trader</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body,#root{height:100%;background:#07080f;overflow:hidden;}
+  body{color:#9aa5b4;font-family:'Barlow',sans-serif;overscroll-behavior:none;-webkit-tap-highlight-color:transparent;}
+  #root{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);}
+  ::-webkit-scrollbar{width:3px;} ::-webkit-scrollbar-thumb{background:#151c28;border-radius:2px;}
+  @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+  @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  .tap:active{opacity:.65;} input{font-family:'Barlow',sans-serif;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+const START_BUDGET  = 8;
+const GOAL_2X       = 16;
+const GOAL_3X       = 24;
+const STOP_LOSS     = 0.07;
+const TAKE_PROFIT   = 0.18;
+const MAX_POS_PCT   = 0.20;
+const SLIPPAGE_BPS  = 1500;
+const PRICE_MS      = 15000;
+const CYCLE_MS      = 20000;
+const USDC_MINT     = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+const TOKENS = [
+  {id:'WIF',   name:'dogwifhat',          mint:'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',decimals:6, icon:'🐶',fb:2.84},
+  {id:'BONK',  name:'Bonk',               mint:'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',decimals:5, icon:'🐕',fb:0.0000328},
+  {id:'POPCAT',name:'Popcat',             mint:'7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr',decimals:9, icon:'🐱',fb:0.812},
+  {id:'MEW',   name:'cat in a dogs world',mint:'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5', decimals:6, icon:'🐈',fb:0.00921},
+  {id:'MYRO',  name:'Myro',               mint:'HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4',decimals:9,icon:'🐾',fb:0.152},
+  {id:'BOME',  name:'Book of Meme',       mint:'ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82',decimals:6, icon:'📖',fb:0.00892},
+  {id:'SLERF', name:'Slerf',              mint:'7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7LoiVkM3',decimals:9,icon:'😴',fb:0.431},
+  {id:'PONKE', name:'Ponke',              mint:'5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK31CR6Ta', decimals:9, icon:'🦍',fb:0.284},
+];
+const MINT_MAP = Object.fromEntries(TOKENS.map(t=>[t.mint,t.id]));
+
+// ── JUPITER API ───────────────────────────────────────────────────────────────
+async function getJupPrices(){
+  const r = await fetch(`https://api.jup.ag/price/v2?ids=${TOKENS.map(t=>t.mint).join(',')}`);
+  const j = await r.json();
+  const out={};
+  Object.entries(j.data||{}).forEach(([mint,info])=>{
+    const id=MINT_MAP[mint]; if(id&&info?.price) out[id]=parseFloat(info.price);
+  });
+  return out;
+}
+async function getQuote(inMint,outMint,amt){
+  const r=await fetch(`https://quote-api.jup.ag/v6/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amt}&slippageBps=${SLIPPAGE_BPS}`);
+  if(!r.ok) throw new Error('Quote failed '+r.status);
+  return r.json();
+}
+async function getSwapTx(quote,pubkey){
+  const r=await fetch('https://quote-api.jup.ag/v6/swap',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({quoteResponse:quote,userPublicKey:pubkey,wrapAndUnwrapSol:true,dynamicComputeUnitLimit:true,prioritizationFeeLamports:'auto'})
+  });
+  if(!r.ok) throw new Error('SwapTx failed '+r.status);
+  return r.json();
+}
+
+// ── PHANTOM MOBILE WALLET ─────────────────────────────────────────────────────
+// When opened inside Phantom's built-in browser: window.solana is injected automatically
+// When opened in Chrome: we deeplink to Phantom app
+function getProvider(){
+  if(window.phantom?.solana?.isPhantom) return window.phantom.solana;
+  if(window.solana?.isPhantom) return window.solana;
+  return null;
+}
+
+// ── INDICATORS ────────────────────────────────────────────────────────────────
+function rsi(h,n=14){
+  if(h.length<n+1)return 50;
+  const s=h.slice(-n-1);let g=0,l=0;
+  for(let i=1;i<s.length;i++){const d=s[i]-s[i-1];d>0?g+=d:l-=d;}
+  const ag=g/n,al=l/n;return al===0?100:100-100/(1+ag/al);
+}
+function ema(h,n){
+  if(h.length<n)return h[h.length-1];
+  const k=2/(n+1);let e=h.slice(0,n).reduce((a,b)=>a+b,0)/n;
+  for(let i=n;i<h.length;i++)e=h[i]*k+e*(1-k);return e;
+}
+function bb(h,n=20){
+  if(h.length<n)return null;
+  const s=h.slice(-n),m=s.reduce((a,b)=>a+b,0)/n;
+  const std=Math.sqrt(s.reduce((a,b)=>a+(b-m)**2,0)/n);
+  return{upper:m+2*std,mid:m,lower:m-2*std};
+}
+function signals(hist){
+  const p=hist[hist.length-1],r=rsi(hist),e9=ema(hist,9),e21=ema(hist,21),e50=ema(hist,50);
+  const b=bb(hist),mom5=hist.length>6?(p-hist[hist.length-6])/hist[hist.length-6]:0;
+  let bull=0,bear=0,sigs=[];
+  if(r<28){bull+=3;sigs.push('RSI Oversold');}else if(r<42){bull+=1.5;sigs.push('RSI Low');}
+  else if(r>72){bear+=3;sigs.push('RSI Overbought');}else if(r>58){bear+=1.5;sigs.push('RSI High');}
+  if(e9>e21){bull+=2;sigs.push('EMA ↑');}else{bear+=2;sigs.push('EMA ↓');}
+  if(e21>e50){bull+=1;sigs.push('Uptrend');}else{bear+=1;sigs.push('Downtrend');}
+  if(b){if(p<b.lower){bull+=2.5;sigs.push('BB Oversold');}else if(p>b.upper){bear+=2.5;sigs.push('BB Overbought');}}
+  if(mom5>0.025){bull+=2;sigs.push('Mom ↑');}else if(mom5<-0.025){bear+=2;sigs.push('Mom ↓');}
+  const tot=bull+bear||1,conf=Math.round(Math.max(bull,bear)/tot*100);
+  const dir=bull>bear?'LONG':bull<bear?'SHORT':'NEUTRAL';
+  return{price:p,r,e9,e21,bb:b,mom5,bull,bear,conf,dir,sigs};
+}
+
+// ── AI DECISION ───────────────────────────────────────────────────────────────
+async function aiDecide(token,sig,port,positions,apiKey){
+  const hasPos=positions.find(p=>p.id===token.id);
+  const prompt=`You are SKYNET, a live Solana memecoin AI trader via Phantom+Jupiter.
+Budget: $${port.usdc.toFixed(3)} USDC | Total: $${port.total.toFixed(3)} | Goal: 2×=$${GOAL_2X} 3×=$${GOAL_3X}
+TOKEN: ${token.id} (${token.name}) PRICE: $${sig.price.toFixed(8)}
+POSITION: ${hasPos?`OPEN LONG @ $${hasPos.entry.toFixed(8)} size $${hasPos.size.toFixed(3)} P&L:${(((sig.price-hasPos.entry)/hasPos.entry)*100).toFixed(1)}%`:'None'}
+RSI:${sig.r.toFixed(1)} Bull:${sig.bull.toFixed(1)} Bear:${sig.bear.toFixed(1)} Conf:${sig.conf}%
+Signals: ${sig.sigs.join(', ')} Mom:${(sig.mom5*100).toFixed(2)}%
+Rules: LONG only. SL 7% TP 18%. Max $${(port.total*MAX_POS_PCT).toFixed(2)}. Trade if conf>=55%.
+Reply ONLY raw JSON: {"action":"BUY","sizePct":0.18,"reason":"brief","confidence":67,"strategy":"momentum"}
+action=BUY|CLOSE|HOLD`;
+  try{
+    const r=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
+      body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:120,messages:[{role:'user',content:prompt}]})
+    });
+    const d=await r.json();
+    const txt=d.content?.find(b=>b.type==='text')?.text||'{}';
+    return JSON.parse(txt.replace(/```json|```/g,'').trim());
+  }catch{
+    if(sig.conf>=58&&sig.dir==='LONG'&&!hasPos)
+      return{action:'BUY',sizePct:0.15,reason:'Rule-based bull',confidence:sig.conf,strategy:'signals'};
+    return{action:'HOLD',reason:'No signal',confidence:0};
+  }
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function fmtP(n){
+  if(!n&&n!==0)return'—';
+  if(n>=1000)return'$'+n.toLocaleString('en-US',{maximumFractionDigits:2});
+  if(n>=1)return'$'+n.toFixed(4);if(n>=0.001)return'$'+n.toFixed(5);return'$'+n.toFixed(8);
+}
+
+function Spark({data,color,w=72,h=28}){
+  if(!data||data.length<2)return React.createElement('div',{style:{width:w,height:h}});
+  const mn=Math.min(...data),mx=Math.max(...data),rng=mx-mn||1;
+  const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/rng)*(h-3)-1}`).join(' ');
+  return React.createElement('svg',{width:w,height:h},
+    React.createElement('defs',null,
+      React.createElement('linearGradient',{id:`g${color.slice(1)}`,x1:'0',y1:'0',x2:'0',y2:'1'},
+        React.createElement('stop',{offset:'0%',stopColor:color,stopOpacity:'0.2'}),
+        React.createElement('stop',{offset:'100%',stopColor:color,stopOpacity:'0'})
+      )
+    ),
+    React.createElement('polygon',{points:`${pts} ${w},${h} 0,${h}`,fill:`url(#g${color.slice(1)})`}),
+    React.createElement('polyline',{points:pts,fill:'none',stroke:color,strokeWidth:'1.5',strokeLinejoin:'round'})
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function App(){
+  const [wallet,      setWallet]      = useState(()=>localStorage.getItem('sn_wallet')||'');
+  const [apiKey,      setApiKey]      = useState(()=>localStorage.getItem('sn_apikey')||'');
+  const [screen,      setScreen]      = useState(()=>!localStorage.getItem('sn_wallet')?'connect':!localStorage.getItem('sn_apikey')?'apikey':'main');
+  const [provider,    setProvider]    = useState(null);
+  const [prices,      setPrices]      = useState({});
+  const [priceHist,   setPriceHist]   = useState({});
+  const [positions,   setPositions]   = useState([]);
+  const [closed,      setClosed]      = useState([]);
+  const [usdc,        setUsdc]        = useState(0);
+  const [solBal,      setSolBal]      = useState(0);
+  const [running,     setRunning]     = useState(false);
+  const [scanning,    setScanning]    = useState(false);
+  const [txPending,   setTxPending]   = useState(false);
+  const [tab,         setTab]         = useState('market');
+  const [log,         setLog]         = useState([{t:Date.now(),msg:'👻 SKYNET ready. Connect Phantom to start.',type:'sys'}]);
+  const [apiInput,    setApiInput]    = useState('');
+  const [walletInput, setWalletInput] = useState('');
+  const cidx=useRef(0), priceTimer=useRef(null), cycleTimer=useRef(null);
+  const posRef=useRef(positions), pricesRef=useRef(prices), usdcRef=useRef(usdc);
+  useEffect(()=>{posRef.current=positions;},[positions]);
+  useEffect(()=>{pricesRef.current=prices;},[prices]);
+  useEffect(()=>{usdcRef.current=usdc;},[usdc]);
+
+  function log2(msg,type='info'){setLog(p=>[{t:Date.now(),msg,type},...p].slice(0,200));}
+
+  // ── CONNECT PHANTOM ───────────────────────────────────────────────────────
+  async function connectPhantom(){
+    const p=getProvider();
+    if(p){
+      try{
+        const resp=await p.connect();
+        const addr=resp.publicKey.toString();
+        localStorage.setItem('sn_wallet',addr);
+        setWallet(addr); setProvider(p);
+        log2(`✅ Connected: ${addr.slice(0,8)}…${addr.slice(-4)}`,'sys');
+        if(!apiKey) setScreen('apikey'); else setScreen('main');
+      }catch(e){log2('❌ Phantom rejected: '+e.message,'warn');}
+    } else {
+      // Not inside Phantom browser — open Phantom app deeplink
+      window.location.href='https://phantom.app/ul/browse/'+encodeURIComponent(window.location.href)+'?ref='+encodeURIComponent(window.location.origin);
+    }
+  }
+
+  function saveWalletManual(){
+    if(!walletInput||walletInput.length<30)return;
+    localStorage.setItem('sn_wallet',walletInput);
+    setWallet(walletInput);
+    log2(`✅ Wallet saved: ${walletInput.slice(0,8)}…`,'sys');
+    if(!apiKey) setScreen('apikey'); else setScreen('main');
+  }
+
+  function saveApiKey(){
+    if(!apiInput||!apiInput.startsWith('sk-'))return;
+    localStorage.setItem('sn_apikey',apiInput);
+    setApiKey(apiInput);
+    setScreen('main');
+    log2('🔑 API key saved.','sys');
+  }
+
+  // ── PRICES ────────────────────────────────────────────────────────────────
+  async function refreshPrices(){
+    try{
+      const live=await getJupPrices();
+      if(!Object.keys(live).length)return;
+      setPrices(live);
+      setPriceHist(prev=>{
+        const n={...prev};
+        Object.entries(live).forEach(([id,p])=>{n[id]=[...(prev[id]||[]).slice(-99),p];});
+        return n;
+      });
+      checkStops(live);
+    }catch(e){log2('⚠️ Price: '+e.message,'warn');}
+  }
+
+  // ── STOP/TP ───────────────────────────────────────────────────────────────
+  function checkStops(liveP){
+    posRef.current.forEach(async pos=>{
+      const p=liveP[pos.id]; if(!p)return;
+      const pct=(p-pos.entry)/pos.entry;
+      if(pct<=-STOP_LOSS){log2(`🛑 SL ${pos.icon}${pos.id} ${(pct*100).toFixed(1)}%`,'warn');await doSell(pos,'STOP_LOSS');}
+      else if(pct>=TAKE_PROFIT){log2(`🎯 TP ${pos.icon}${pos.id} +${(pct*100).toFixed(1)}%`,'win');await doSell(pos,'TAKE_PROFIT');}
+    });
+  }
+
+  // ── BUY ───────────────────────────────────────────────────────────────────
+  async function doBuy(token,usdAmt){
+    const prov=provider||getProvider();
+    if(!prov&&!wallet){throw new Error('No wallet');}
+    setTxPending(true);
+    log2(`🔄 BUY ${token.icon}${token.id} $${usdAmt.toFixed(3)} via Jupiter…`,'info');
+    try{
+      const units=Math.floor(usdAmt*1_000_000);
+      const quote=await getQuote(USDC_MINT,token.mint,units);
+      const outAmt=parseInt(quote.outAmount)/Math.pow(10,token.decimals);
+      log2(`📊 ${usdAmt.toFixed(3)} USDC → ${outAmt.toFixed(4)} ${token.id}`,'info');
+      const {swapTransaction}=await getSwapTx(quote,wallet);
+
+      if(prov){
+        // Inside Phantom browser — sign directly
+        const buf=Uint8Array.from(atob(swapTransaction),c=>c.charCodeAt(0));
+        const {signature}=await prov.signAndSendTransaction({serialize:()=>buf,serializeMessage:()=>buf});
+        log2(`✅ TX: ${signature.slice(0,16)}…`,'buy');
+      } else {
+        // Chrome — redirect to Phantom to sign
+        const jupUrl=`https://jup.ag/swap/USDC-${token.id}`;
+        log2(`📱 Opening Jupiter in Phantom to complete swap…`,'info');
+        window.open(jupUrl,'_blank');
+      }
+
+      const entry=pricesRef.current[token.id]||token.fb;
+      setPositions(p=>[...p,{id:token.id,name:token.name,icon:token.icon,entry,size:usdAmt,tokens:outAmt,sl:entry*(1-STOP_LOSS),tp:entry*(1+TAKE_PROFIT),time:Date.now()}]);
+      setUsdc(u=>Math.max(u-usdAmt,0));
+    }finally{setTxPending(false);}
+  }
+
+  // ── SELL ──────────────────────────────────────────────────────────────────
+  async function doSell(pos,reason='AI'){
+    const prov=provider||getProvider();
+    setTxPending(true);
+    log2(`🔄 SELL ${pos.icon}${pos.id} (${reason})…`,'info');
+    try{
+      const tok=TOKENS.find(t=>t.id===pos.id);
+      const units=Math.floor(pos.tokens*Math.pow(10,tok.decimals));
+      const quote=await getQuote(tok.mint,USDC_MINT,units);
+      const usdcOut=parseInt(quote.outAmount)/1_000_000;
+      const {swapTransaction}=await getSwapTx(quote,wallet);
+
+      if(prov){
+        const buf=Uint8Array.from(atob(swapTransaction),c=>c.charCodeAt(0));
+        const {signature}=await prov.signAndSendTransaction({serialize:()=>buf,serializeMessage:()=>buf});
+        log2(`✅ SELL TX: ${signature.slice(0,16)}…`,'info');
+      } else {
+        window.open(`https://jup.ag/swap/${tok.id}-USDC`,'_blank');
+      }
+
+      const exit=pricesRef.current[pos.id]||pos.entry;
+      const pnl=usdcOut-pos.size, pnlPct=(exit-pos.entry)/pos.entry;
+      setPositions(p=>p.filter(x=>x.id!==pos.id));
+      setClosed(p=>[{...pos,exit,pnl,pnlPct,reason,closeTime:Date.now()},...p]);
+      setUsdc(u=>u+usdcOut);
+      log2(`${pnl>=0?'✅':'❌'} CLOSED ${pos.icon}${pos.id} ${pnl>=0?'+':''}$${pnl.toFixed(4)}`,(pnl>=0?'win':'loss'));
+    }catch(e){log2(`⚠️ Sell failed: ${e.message}`,'warn');}
+    finally{setTxPending(false);}
+  }
+
+  // ── TRADING CYCLE ─────────────────────────────────────────────────────────
+  async function doCycle(){
+    if(scanning||txPending||!wallet||!apiKey)return;
+    setScanning(true);
+    const pos=posRef.current, u=usdcRef.current;
+    const total=u+pos.reduce((s,p)=>s+p.size*(1+((pricesRef.current[p.id]||p.entry)-p.entry)/p.entry),0);
+    const t1=TOKENS[cidx.current%TOKENS.length], t2=TOKENS[(cidx.current+1)%TOKENS.length];
+    cidx.current+=2;
+    for(const token of [t1,t2]){
+      if(txPending)break;
+      const hist=priceHist[token.id]||[]; if(hist.length<20)continue;
+      const sig=signals(hist);
+      if(sig.conf<52){log2(`⏭ ${token.icon}${token.id} conf ${sig.conf}%`,'dim');continue;}
+      const hasPos=pos.find(p=>p.id===token.id);
+      try{
+        const dec=await aiDecide(token,sig,{usdc:u,total},pos,apiKey);
+        if(!dec||dec.action==='HOLD'){log2(`⏸ HOLD ${token.icon}${token.id} — ${dec?.reason||'no signal'}`,'dim');continue;}
+        if(dec.action==='BUY'&&!hasPos&&u>=0.5){
+          const sz=Math.min(u*Math.min(dec.sizePct||0.15,MAX_POS_PCT),total*MAX_POS_PCT);
+          if(sz>=0.5)await doBuy(token,sz);
+        }else if(dec.action==='CLOSE'&&hasPos){await doSell(hasPos,'AI_CLOSE');}
+      }catch(e){log2(`⚠️ ${token.id}: ${e.message}`,'warn');}
+      await new Promise(r=>setTimeout(r,700));
+    }
+    setScanning(false);
+  }
+
+  // ── START/STOP ────────────────────────────────────────────────────────────
+  async function handleStart(){
+    if(!wallet){setScreen('connect');return;}
+    if(!apiKey){setScreen('apikey');return;}
+    // Try to get USDC balance via Solana RPC
+    try{
+      const r=await fetch('https://api.mainnet-beta.solana.com',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'getTokenAccountsByOwner',
+          params:[wallet,{mint:USDC_MINT},{encoding:'jsonParsed'}]})
+      });
+      const d=await r.json();
+      const bal=d.result?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount||0;
+      setUsdc(bal);
+      log2(`💰 USDC balance: $${bal.toFixed(3)}`,'sys');
+
+      const sr=await fetch('https://api.mainnet-beta.solana.com',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({jsonrpc:'2.0',id:1,method:'getBalance',params:[wallet]})
+      });
+      const sd=await sr.json();
+      const sol=(sd.result?.value||0)/1e9; setSolBal(sol);
+      log2(`⚡ SOL balance: ${sol.toFixed(4)}`,'sys');
+    }catch(e){log2('⚠️ Could not fetch balance — using estimate','warn');setUsdc(START_BUDGET);}
+
+    setRunning(true);
+    log2(`▶ SKYNET LIVE | Wallet: ${wallet.slice(0,8)}… | Goal: $${GOAL_2X}/$${GOAL_3X}`,'sys');
+    await refreshPrices();
+    priceTimer.current=setInterval(refreshPrices,PRICE_MS);
+    cycleTimer.current=setInterval(doCycle,CYCLE_MS);
+    setTimeout(doCycle,3000);
+  }
+
+  function handleStop(){
+    setRunning(false);
+    clearInterval(priceTimer.current); clearInterval(cycleTimer.current);
+    log2('⏹ SKYNET stopped.','sys');
+  }
+
+  useEffect(()=>{
+    refreshPrices();
+    const p=getProvider();
+    if(p){setProvider(p);if(p.publicKey){const a=p.publicKey.toString();if(a&&!wallet){localStorage.setItem('sn_wallet',a);setWallet(a);}}}
+    return()=>{clearInterval(priceTimer.current);clearInterval(cycleTimer.current);};
+  },[]);
+
+  // ── COMPUTED ──────────────────────────────────────────────────────────────
+  const posVal=positions.reduce((s,p)=>s+p.size*(1+((prices[p.id]||p.entry)-p.entry)/p.entry),0);
+  const total=usdc+posVal;
+  const wins=closed.filter(t=>t.pnl>0).length;
+  const winRate=closed.length?wins/closed.length*100:0;
+  const totalPnL=closed.reduce((s,t)=>s+t.pnl,0);
+  const prog=Math.min(Math.max((total-START_BUDGET)/(GOAL_2X-START_BUDGET)*100,0),100);
+  const reached2x=total>=GOAL_2X, reached3x=total>=GOAL_3X;
+  const logColors={sys:'#ab9ff2',buy:'#51cf66',sell:'#ff6b6b',win:'#51cf66',loss:'#ff6b6b',warn:'#f0b429',dim:'#1e2d40',info:'#4fc3f7'};
+
+  // ── CONNECT SCREEN ────────────────────────────────────────────────────────
+  if(screen==='connect') return (
+    <div style={{minHeight:'100vh',background:'#07080f',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:28,gap:20,animation:'fadeIn 0.4s ease'}}>
+      <div style={{fontSize:64}}>👻</div>
+      <div style={{fontFamily:"'Space Mono',monospace",fontWeight:700,fontSize:24,textAlign:'center'}}>
+        <span style={{color:'#ff6b6b'}}>SKY</span><span style={{color:'#ab9ff2'}}>NET</span>
+      </div>
+      <div style={{fontSize:14,color:'#2a3545',textAlign:'center',maxWidth:300,lineHeight:1.7}}>
+        Live Solana memecoin trader.<br/>Connect your Phantom burner wallet to begin.
+      </div>
+
+      <button className="tap" onClick={connectPhantom} style={{width:'100%',maxWidth:320,padding:'16px',background:'linear-gradient(135deg,#ab9ff2,#7c5cbf)',border:'none',borderRadius:14,color:'#fff',fontSize:16,fontWeight:700,cursor:'pointer',fontFamily:"'Space Mono',monospace",letterSpacing:'0.05em',boxShadow:'0 4px 24px #ab9ff230'}}>
+        👻 CONNECT PHANTOM
+      </button>
+
+      <div style={{color:'#1e2d40',fontSize:12,textAlign:'center'}}>— or enter wallet address manually —</div>
+
+      <div style={{width:'100%',maxWidth:320,display:'flex',flexDirection:'column',gap:10}}>
+        <input value={walletInput} onChange={e=>setWalletInput(e.target.value)}
+          placeholder="Paste Solana wallet address…"
+          style={{width:'100%',padding:'13px 16px',background:'#0d1220',border:'1px solid #1a1f2e',borderRadius:12,color:'#e8f0f8',fontSize:13,fontFamily:'monospace',outline:'none'}}/>
+        <button className="tap" onClick={saveWalletManual} style={{padding:'13px',background:'rgba(171,159,242,0.12)',border:'1px solid rgba(171,159,242,0.25)',borderRadius:12,color:'#ab9ff2',fontSize:13,fontWeight:700,cursor:'pointer',fontFamily:"'Space Mono',monospace"}}>
+          SAVE WALLET →
+        </button>
+      </div>
+
+      <div style={{fontSize:11,color:'#0f1220',textAlign:'center',maxWidth:280,lineHeight:1.8}}>
+        ⚠️ Burner wallet only. Never use your main wallet. Memecoins can go to zero.
+      </div>
+    </div>
+  );
+
+  // ── API KEY SCREEN ────────────────────────────────────────────────────────
+  if(screen==='apikey') return (
+    <div style={{minHeight:'100vh',background:'#07080f',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:28,gap:18,animation:'fadeIn 0.4s ease'}}>
+      <div style={{fontSize:48}}>🔑</div>
+      <div style={{fontFamily:"'Space Mono',monospace",color:'#ab9ff2',fontSize:18,fontWeight:700}}>ANTHROPIC API KEY</div>
+      <div style={{fontSize:13,color:'#2a3545',textAlign:'center',maxWidth:300,lineHeight:1.7}}>
+        SKYNET uses Claude AI to make trade decisions.<br/>
+        Get your free key at <span style={{color:'#ab9ff2'}}>console.anthropic.com</span>
+      </div>
+      <input value={apiInput} onChange={e=>setApiInput(e.target.value)}
+        type="password" placeholder="sk-ant-api03-…"
+        style={{width:'100%',maxWidth:320,padding:'13px 16px',background:'#0d1220',border:'1px solid #1a1f2e',borderRadius:12,color:'#e8f0f8',fontSize:13,fontFamily:'monospace',outline:'none'}}/>
+      <button className="tap" onClick={saveApiKey} style={{width:'100%',maxWidth:320,padding:'15px',background:'linear-gradient(135deg,#51cf66,#2f9e44)',border:'none',borderRadius:12,color:'#000',fontSize:15,fontWeight:700,cursor:'pointer',fontFamily:"'Space Mono',monospace"}}>
+        SAVE & CONTINUE →
+      </button>
+      <button className="tap" onClick={()=>setScreen('main')} style={{background:'none',border:'none',color:'#1e2d40',fontSize:12,cursor:'pointer'}}>Skip for now</button>
+    </div>
+  );
+
+  // ── MAIN SCREEN ───────────────────────────────────────────────────────────
+  return (
+    <div style={{height:'100vh',display:'flex',flexDirection:'column',background:'#07080f',overflow:'hidden'}}>
+
+      {/* HEADER */}
+      <div style={{background:'rgba(7,8,15,0.98)',borderBottom:'1px solid #0f1220',padding:'10px 14px',display:'flex',alignItems:'center',gap:10,flexShrink:0}}>
+        <div style={{fontFamily:"'Space Mono',monospace",fontWeight:700,fontSize:17}}>
+          <span style={{color:'#ff6b6b'}}>SKY</span><span style={{color:'#ab9ff2'}}>NET</span>
+        </div>
+        <div style={{display:'flex',alignItems:'center',gap:5,padding:'3px 8px',background:'rgba(171,159,242,0.08)',border:'1px solid rgba(171,159,242,0.2)',borderRadius:20}}>
+          <div style={{width:6,height:6,borderRadius:'50%',background:running?'#51cf66':'#333',animation:running?'pulse 1.5s infinite':'none'}}/>
+          <span style={{fontSize:9,color:running?'#51cf66':'#333',fontFamily:"'Space Mono',monospace"}}>{running?'LIVE':'OFF'}</span>
+        </div>
+        {txPending&&<div style={{display:'flex',alignItems:'center',gap:4}}>
+          <div style={{width:9,height:9,border:'2px solid #f0b429',borderTopColor:'transparent',borderRadius:'50%',animation:'spin 0.8s linear infinite'}}/>
+          <span style={{fontSize:9,color:'#f0b429',fontFamily:"'Space Mono',monospace"}}>TX…</span>
+        </div>}
+        <div style={{marginLeft:'auto',display:'flex',gap:6,alignItems:'center'}}>
+          <button className="tap" onClick={()=>setScreen('apikey')}
+            style={{padding:'5px 8px',background:'#0d1220',border:`1px solid ${apiKey?'#51cf6640':'#f0b42940'}`,borderRadius:6,color:apiKey?'#51cf66':'#f0b429',fontSize:10,fontFamily:"'Space Mono',monospace"}}>
+            {apiKey?'🔑✓':'🔑?'}
+          </button>
+          <button className="tap" onClick={()=>setScreen('connect')}
+            style={{padding:'5px 8px',background:'#0d1220',border:'1px solid #1a1f2e',borderRadius:6,color:'#ab9ff2',fontSize:10,fontFamily:"'Space Mono',monospace"}}>
+            {wallet?wallet.slice(0,4)+'…':'👻'}
+          </button>
+          {!running
+            ?<button className="tap" onClick={handleStart} style={{padding:'7px 14px',background:'linear-gradient(135deg,#51cf66,#2f9e44)',border:'none',borderRadius:8,color:'#000',fontSize:12,fontWeight:700,fontFamily:"'Space Mono',monospace"}}>▶ START</button>
+            :<button className="tap" onClick={handleStop}  style={{padding:'7px 14px',background:'rgba(255,107,107,0.1)',border:'1px solid #ff6b6b40',borderRadius:8,color:'#ff6b6b',fontSize:12,fontWeight:700,fontFamily:"'Space Mono',monospace"}}>⏹ STOP</button>
+          }
+        </div>
+      </div>
+
+      {/* STATS */}
+      <div style={{background:'#090b14',borderBottom:'1px solid #0f1220',padding:'10px 14px',flexShrink:0}}>
+        <div style={{display:'flex',gap:16,marginBottom:8,flexWrap:'wrap'}}>
+          {[
+            ['PORTFOLIO',`$${total.toFixed(3)}`,total>=START_BUDGET?'#51cf66':'#ff6b6b'],
+            ['USDC',`$${usdc.toFixed(3)}`,'#9aa5b4'],
+            ['RETURN',(total-START_BUDGET>=0?'+':'')+((total-START_BUDGET)/START_BUDGET*100).toFixed(1)+'%',total>=START_BUDGET?'#51cf66':'#ff6b6b'],
+            ['WIN RATE',closed.length?`${winRate.toFixed(0)}% (${wins}/${closed.length})`:'—',winRate>=50?'#51cf66':'#f0b429'],
+          ].map(([k,v,c])=>(
+            <div key={k}>
+              <div style={{fontSize:8,color:'#151c28',fontFamily:"'Space Mono',monospace",textTransform:'uppercase',marginBottom:2}}>{k}</div>
+              <div style={{fontSize:14,fontWeight:700,fontFamily:"'Space Mono',monospace",color:c}}>{v}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+          <span style={{fontSize:8,color:'#151c28',fontFamily:"'Space Mono',monospace"}}>$8 → 2× $16 | 3× $24</span>
+          <span style={{fontSize:8,color:'#ab9ff2',fontFamily:"'Space Mono',monospace"}}>{prog.toFixed(0)}%</span>
+        </div>
+        <div style={{height:5,background:'#0d1220',borderRadius:3,position:'relative'}}>
+          <div style={{width:`${prog}%`,height:'100%',background:'linear-gradient(90deg,#ab9ff2,#51cf66,#f0b429)',borderRadius:3,transition:'width 1s'}}/>
+          <div style={{position:'absolute',left:'50%',top:-2,width:1,height:9,background:'#51cf6660'}}/>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',marginTop:2}}>
+          <span style={{fontSize:7,color:'#151c28',fontFamily:"'Space Mono',monospace"}}>$8</span>
+          <span style={{fontSize:7,color:reached2x?'#51cf66':'#1e2d40',fontFamily:"'Space Mono',monospace"}}>2× $16 {reached2x?'✓':''}</span>
+          <span style={{fontSize:7,color:reached3x?'#f0b429':'#1e2d40',fontFamily:"'Space Mono',monospace"}}>3× $24 {reached3x?'✓':''}</span>
+        </div>
+      </div>
+
+      {/* TABS */}
+      <div style={{display:'flex',background:'#090b14',borderBottom:'1px solid #0f1220',flexShrink:0}}>
+        {[['market','🌊'],['positions',`📊${positions.length?'('+positions.length+')':''}` ],['trades',`📋${closed.length?'('+closed.length+')':''}` ],['log','📡']].map(([id,label])=>(
+          <button key={id} className="tap" onClick={()=>setTab(id)} style={{flex:1,padding:'10px 4px',border:'none',background:'transparent',cursor:'pointer',color:tab===id?'#ab9ff2':'#1e2d40',fontSize:11,fontFamily:"'Space Mono',monospace",borderBottom:`2px solid ${tab===id?'#ab9ff2':'transparent'}`,transition:'color 0.2s'}}>{label}</button>
+        ))}
+      </div>
+
+      {/* CONTENT */}
+      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch'}}>
+
+        {/* MARKET */}
+        {tab==='market'&&(
+          <div style={{padding:10,display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+            {TOKENS.map(token=>{
+              const price=prices[token.id]||token.fb;
+              const hist=priceHist[token.id]||[];
+              const prev=hist[hist.length-2]||price;
+              const chg=(price-prev)/prev;
+              const sig=hist.length>20?signals(hist):null;
+              const pos=positions.find(p=>p.id===token.id);
+              return(
+                <div key={token.id} style={{background:'#09080f',border:`1px solid ${pos?'rgba(171,159,242,0.3)':'#0f1220'}`,borderRadius:12,padding:11}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+                    <div>
+                      <div style={{display:'flex',alignItems:'center',gap:4,marginBottom:1}}>
+                        <span style={{fontSize:14}}>{token.icon}</span>
+                        <span style={{fontFamily:"'Space Mono',monospace",fontWeight:700,fontSize:12,color:'#c8d8e8'}}>{token.id}</span>
+                        {pos&&<span style={{fontSize:7,padding:'1px 4px',borderRadius:3,background:'rgba(171,159,242,0.12)',color:'#ab9ff2',fontFamily:"'Space Mono',monospace"}}>OPEN</span>}
+                      </div>
+                      <div style={{fontSize:8,color:'#151c28'}}>{token.name.slice(0,12)}</div>
+                    </div>
+                    <Spark data={hist.slice(-30)} color={chg>=0?'#51cf66':'#ff6b6b'} w={60} h={24}/>
+                  </div>
+                  <div style={{fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,color:'#e8f0f8',marginBottom:4}}>{fmtP(price)}</div>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                    <span style={{fontSize:10,fontFamily:"'Space Mono',monospace",color:chg>=0?'#51cf66':'#ff6b6b'}}>{chg>=0?'▲':'▼'}{Math.abs(chg*100).toFixed(2)}%</span>
+                    {sig&&<span style={{fontSize:8,padding:'1px 5px',borderRadius:3,fontFamily:"'Space Mono',monospace",background:sig.dir==='LONG'?'rgba(81,207,102,0.1)':'rgba(255,107,107,0.1)',color:sig.dir==='LONG'?'#51cf66':sig.dir==='SHORT'?'#ff6b6b':'#333'}}>{sig.dir} {sig.conf}%</span>}
+                  </div>
+                  {pos&&(()=>{
+                    const pct=(price-pos.entry)/pos.entry,pnl=pct*pos.size;
+                    return<div style={{marginTop:6,paddingTop:6,borderTop:'1px solid #0f1220',fontSize:10,fontFamily:"'Space Mono',monospace",color:pnl>=0?'#51cf66':'#ff6b6b',fontWeight:700}}>{pnl>=0?'+':''}${pnl.toFixed(4)}</div>;
+                  })()}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* POSITIONS */}
+        {tab==='positions'&&(
+          <div style={{padding:12}}>
+            {positions.length===0
+              ?<div style={{textAlign:'center',padding:60,color:'#151c28',fontFamily:"'Space Mono',monospace",fontSize:12}}>No open positions{!running?' — press ▶ START':''}</div>
+              :positions.map(pos=>{
+                const price=prices[pos.id]||pos.entry;
+                const pct=(price-pos.entry)/pos.entry,pnl=pct*pos.size;
+                return(
+                  <div key={pos.id} style={{background:'#09080f',border:`1px solid ${pnl>=0?'#51cf6625':'#ff6b6b25'}`,borderRadius:12,padding:14,marginBottom:10,animation:'fadeIn 0.3s ease'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:10}}>
+                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                        <span style={{fontSize:22}}>{pos.icon}</span>
+                        <div>
+                          <div style={{fontFamily:"'Space Mono',monospace",fontWeight:700,fontSize:14,color:'#c8d8e8'}}>{pos.id}</div>
+                          <div style={{fontSize:9,color:'#1e2d40',fontFamily:"'Space Mono',monospace"}}>Entry {fmtP(pos.entry)} · $${pos.size.toFixed(3)}</div>
+                        </div>
+                      </div>
+                      <div style={{textAlign:'right'}}>
+                        <div style={{fontSize:20,fontWeight:700,fontFamily:"'Space Mono',monospace",color:pnl>=0?'#51cf66':'#ff6b6b'}}>{pnl>=0?'+':''}${pnl.toFixed(4)}</div>
+                        <div style={{fontSize:11,color:pnl>=0?'#51cf66':'#ff6b6b',fontFamily:"'Space Mono',monospace"}}>{(pct*100).toFixed(2)}%</div>
+                      </div>
+                    </div>
+                    <div style={{height:4,background:'#0d1220',borderRadius:2,marginBottom:8}}>
+                      <div style={{width:`${Math.min(Math.max(pct/TAKE_PROFIT*100,0),100)}%`,height:'100%',background:pnl>=0?'#51cf66':'#ff6b6b',borderRadius:2,transition:'width 0.6s'}}/>
+                    </div>
+                    <div style={{display:'flex',gap:6,fontSize:9,color:'#1e2d40',fontFamily:"'Space Mono',monospace",marginBottom:10}}>
+                      <span>SL {fmtP(pos.sl)}</span><span>TP {fmtP(pos.tp)}</span><span>Now {fmtP(price)}</span>
+                    </div>
+                    <button className="tap" onClick={()=>doSell(pos,'MANUAL')} disabled={txPending}
+                      style={{width:'100%',padding:'11px',background:'rgba(255,107,107,0.08)',border:'1px solid #ff6b6b30',borderRadius:9,color:txPending?'#333':'#ff6b6b',fontSize:13,cursor:txPending?'not-allowed':'pointer',fontFamily:"'Space Mono',monospace",fontWeight:700}}>
+                      {txPending?'⏳ TX PENDING…':'SELL NOW'}
+                    </button>
+                  </div>
+                );
+              })
+            }
+          </div>
+        )}
+
+        {/* TRADES */}
+        {tab==='trades'&&(
+          <div style={{padding:12}}>
+            {closed.length===0
+              ?<div style={{textAlign:'center',padding:60,color:'#151c28',fontFamily:"'Space Mono',monospace",fontSize:12}}>No closed trades yet</div>
+              :closed.map((t,i)=>(
+                <div key={i} style={{padding:'11px 10px',borderBottom:'1px solid #0d1220',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <div>
+                    <div style={{marginBottom:3}}>{t.icon} <span style={{fontFamily:"'Space Mono',monospace",color:'#ab9ff2',fontSize:13}}>{t.id}</span></div>
+                    <div style={{fontSize:9,color:'#1e2d40',fontFamily:"'Space Mono',monospace"}}>{t.reason} · {fmtP(t.entry)} → {fmtP(t.exit)}</div>
+                  </div>
+                  <div style={{textAlign:'right'}}>
+                    <div style={{fontFamily:"'Space Mono',monospace",fontWeight:700,fontSize:15,color:t.pnl>=0?'#51cf66':'#ff6b6b'}}>{t.pnl>=0?'+':''}${t.pnl?.toFixed(4)}</div>
+                    <div style={{fontSize:10,color:t.pnlPct>=0?'#51cf66':'#ff6b6b',fontFamily:"'Space Mono',monospace"}}>{(t.pnlPct*100)?.toFixed(1)}%</div>
+                  </div>
+                </div>
+              ))
+            }
+          </div>
+        )}
+
+        {/* LOG */}
+        {tab==='log'&&(
+          <div style={{padding:12}}>
+            {log.map((e,i)=>(
+              <div key={i} style={{display:'flex',gap:8,padding:'4px 0',borderBottom:'1px solid #07080f'}}>
+                <span style={{fontSize:8,color:'#0f1220',fontFamily:"'Space Mono',monospace",flexShrink:0,marginTop:1}}>{new Date(e.t).toLocaleTimeString()}</span>
+                <span style={{fontSize:10,color:logColors[e.type]||'#9aa5b4',fontFamily:"'Space Mono',monospace",lineHeight:1.6}}>{e.msg}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
