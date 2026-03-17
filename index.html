@@ -37,7 +37,7 @@ const TAKE_PROFIT   = 0.18;
 const MAX_POS_PCT   = 0.20;
 const SLIPPAGE_BPS  = 1500;
 const PRICE_MS      = 10000;
-const CYCLE_MS      = 15000;
+const CYCLE_MS      = 12000;
 const USDC_MINT     = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 const TOKENS = [
@@ -153,16 +153,24 @@ action=BUY|CLOSE|HOLD`;
   try{
     const r=await fetch('https://api.anthropic.com/v1/messages',{
       method:'POST',
-      headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01'},
+      headers:{
+        'Content-Type':'application/json',
+        'x-api-key':apiKey,
+        'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true'
+      },
       body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:120,messages:[{role:'user',content:prompt}]})
     });
     const d=await r.json();
     const txt=d.content?.find(b=>b.type==='text')?.text||'{}';
     return JSON.parse(txt.replace(/```json|```/g,'').trim());
-  }catch{
+  }catch(e){
+    log2('🤖 AI fallback (rule-based): '+e.message,'dim');
     if(sig.conf>=45&&sig.dir==='LONG'&&!hasPos)
-      return{action:'BUY',sizePct:0.15,reason:'Rule-based bull',confidence:sig.conf,strategy:'signals'};
-    return{action:'HOLD',reason:'No signal',confidence:0};
+      return{action:'BUY',sizePct:0.15,reason:'Rule-based: '+sig.sigs.slice(0,2).join('+'),confidence:sig.conf,strategy:'signals'};
+    if(sig.dir==='LONG'&&bull>bear&&!hasPos&&u>1)
+      return{action:'BUY',sizePct:0.12,reason:'Bull signals active',confidence:sig.conf,strategy:'momentum'};
+    return{action:'HOLD',reason:'No clear signal',confidence:0};
   }
 }
 
@@ -374,7 +382,11 @@ function App(){
 
   // ── TRADING CYCLE ─────────────────────────────────────────────────────────
   async function doCycle(){
-    if(scanning||txPending||!wallet||!apiKey)return;
+    if(scanning||txPending||!wallet||!apiKey){
+      log2(`🔍 Cycle skip — scanning:${scanning} tx:${txPending} wallet:${!!wallet} key:${!!apiKey}`,'dim');
+      return;
+    }
+    log2('🔍 SKYNET scanning markets…','info');
     setScanning(true);
     const pos=posRef.current, u=usdcRef.current;
     const total=u+pos.reduce((s,p)=>s+p.size*(1+((pricesRef.current[p.id]||p.entry)-p.entry)/p.entry),0);
@@ -384,7 +396,8 @@ function App(){
       if(txPending)break;
       const hist=priceHist[token.id]||[]; if(hist.length<20)continue;
       const sig=signals(hist);
-      if(sig.conf<48){log2(`⏭ ${token.icon}${token.id} conf ${sig.conf}%`,'dim');continue;}
+      log2(`📊 ${token.icon}${token.id} RSI:${sig.r.toFixed(0)} ${sig.dir} conf:${sig.conf}%`,'info');
+      if(sig.conf<48){log2(`⏭ ${token.icon}${token.id} conf ${sig.conf}% — skip`,'dim');continue;}
       const hasPos=pos.find(p=>p.id===token.id);
       try{
         const dec=await aiDecide(token,sig,{usdc:u,total},pos,apiKey);
@@ -413,7 +426,8 @@ function App(){
     await refreshPrices();
     priceTimer.current=setInterval(refreshPrices,PRICE_MS);
     cycleTimer.current=setInterval(doCycle,CYCLE_MS);
-    setTimeout(doCycle,3000);
+    log2(`⏱ Trade cycle set: every ${CYCLE_MS/1000}s. First scan in 5s…`,'sys');
+    setTimeout(doCycle,5000);
   }
 
   function handleStop(){
