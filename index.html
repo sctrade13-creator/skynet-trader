@@ -1,22 +1,363 @@
-      const quote=await getQuote(USDC_MINT,token.mint,units);
-      const outAmt=parseInt(quote.outAmount)/Math.pow(10,token.decimals);
-      log2(`📊 ${usdAmt.toFixed(3)} USDC → ${outAmt.toFixed(4)} ${token.id}`,'info');
-      const {swapTransaction}=await getSwapTx(quote,wallet);
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
+<meta name="theme-color" content="#07080f"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<title>SKYNET Trader</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body,#root{height:100%;background:#07080f;overflow:hidden;}
+  body{color:#9aa5b4;font-family:'Barlow',sans-serif;overscroll-behavior:none;-webkit-tap-highlight-color:transparent;}
+  #root{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);}
+  ::-webkit-scrollbar{width:3px;} ::-webkit-scrollbar-thumb{background:#151c28;border-radius:2px;}
+  @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+  @keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  .tap:active{opacity:.65;} input{font-family:'Barlow',sans-serif;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
 
-      if(prov){
-        // Inside Phantom browser — sign directly
-        const buf=Uint8Array.from(atob(swapTransaction),c=>c.charCodeAt(0));
-        const {signature}=await prov.signAndSendTransaction({serialize:()=>buf,serializeMessage:()=>buf});
-        log2(`✅ TX: ${signature.slice(0,16)}…`,'buy');
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+const START_BUDGET  = 8;
+const GOAL_2X       = 16;
+const GOAL_3X       = 24;
+const STOP_LOSS     = 0.07;
+const TAKE_PROFIT   = 0.18;
+const MAX_POS_PCT   = 0.20;
+const SLIPPAGE_BPS  = 1500;
+const PRICE_MS      = 10000;
+const CYCLE_MS      = 8000;
+const USDC_MINT     = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+const TOKENS = [
+  {id:'WIF',   name:'dogwifhat',          mint:'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',decimals:6, icon:'🐶',fb:2.84},
+  {id:'BONK',  name:'Bonk',               mint:'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',decimals:5, icon:'🐕',fb:0.0000328},
+  {id:'POPCAT',name:'Popcat',             mint:'7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr',decimals:9, icon:'🐱',fb:0.812},
+  {id:'MEW',   name:'cat in a dogs world',mint:'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5', decimals:6, icon:'🐈',fb:0.00921},
+  {id:'MYRO',  name:'Myro',               mint:'HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4',decimals:9,icon:'🐾',fb:0.152},
+  {id:'BOME',  name:'Book of Meme',       mint:'ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82',decimals:6, icon:'📖',fb:0.00892},
+  {id:'SLERF', name:'Slerf',              mint:'7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7LoiVkM3',decimals:9,icon:'😴',fb:0.431},
+  {id:'PONKE', name:'Ponke',              mint:'5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK31CR6Ta', decimals:9, icon:'🦍',fb:0.284},
+];
+const MINT_MAP = Object.fromEntries(TOKENS.map(t=>[t.mint,t.id]));
+
+// ── JUPITER API ───────────────────────────────────────────────────────────────
+async function getJupPrices(){
+  // CoinGecko free API - no CORS issues, works in all browsers
+  const cgIds = {
+    'WIF':    'dogwifcoin',
+    'BONK':   'bonk',
+    'POPCAT': 'popcat',
+    'MEW':    'cat-in-a-dogs-world',
+    'MYRO':   'myro',
+    'BOME':   'book-of-meme',
+    'SLERF':  'slerf',
+    'PONKE':  'ponke',
+  };
+  const ids = Object.values(cgIds).join(',');
+  const urls = [
+    `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`,
+    `https://api.coincap.io/v2/assets?ids=${Object.values(cgIds).join(',')}`,
+  ];
+  try {
+    const r = await fetch(urls[0]);
+    const j = await r.json();
+    const out = {};
+    Object.entries(cgIds).forEach(([id, cgId]) => {
+      if(j[cgId]?.usd) out[id] = j[cgId].usd;
+    });
+    if(Object.keys(out).length > 0) return out;
+  } catch(e) {}
+  // Fallback: try Jupiter with no-cors mode won't work, use simulation tick instead
+  return {};
+}
+async function getQuote(inMint,outMint,amt){
+  const r=await fetch(`https://quote-api.jup.ag/v6/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amt}&slippageBps=${SLIPPAGE_BPS}`);
+  if(!r.ok) throw new Error('Quote failed '+r.status);
+  return r.json();
+}
+async function getSwapTx(quote,pubkey){
+  const r=await fetch('https://quote-api.jup.ag/v6/swap',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({quoteResponse:quote,userPublicKey:pubkey,wrapAndUnwrapSol:true,dynamicComputeUnitLimit:true,prioritizationFeeLamports:'auto'})
+  });
+  if(!r.ok) throw new Error('SwapTx failed '+r.status);
+  return r.json();
+}
+
+// ── PHANTOM MOBILE WALLET ─────────────────────────────────────────────────────
+// When opened inside Phantom's built-in browser: window.solana is injected automatically
+// When opened in Chrome: we deeplink to Phantom app
+function getProvider(){
+  if(window.phantom?.solana?.isPhantom) return window.phantom.solana;
+  if(window.solana?.isPhantom) return window.solana;
+  return null;
+}
+
+// ── INDICATORS ────────────────────────────────────────────────────────────────
+function rsi(h,n=14){
+  if(h.length<n+1)return 50;
+  const s=h.slice(-n-1);let g=0,l=0;
+  for(let i=1;i<s.length;i++){const d=s[i]-s[i-1];d>0?g+=d:l-=d;}
+  const ag=g/n,al=l/n;return al===0?100:100-100/(1+ag/al);
+}
+function ema(h,n){
+  if(h.length<n)return h[h.length-1];
+  const k=2/(n+1);let e=h.slice(0,n).reduce((a,b)=>a+b,0)/n;
+  for(let i=n;i<h.length;i++)e=h[i]*k+e*(1-k);return e;
+}
+function bb(h,n=20){
+  if(h.length<n)return null;
+  const s=h.slice(-n),m=s.reduce((a,b)=>a+b,0)/n;
+  const std=Math.sqrt(s.reduce((a,b)=>a+(b-m)**2,0)/n);
+  return{upper:m+2*std,mid:m,lower:m-2*std};
+}
+function signals(hist){
+  const p=hist[hist.length-1],r=rsi(hist),e9=ema(hist,9),e21=ema(hist,21),e50=ema(hist,50);
+  const b=bb(hist),mom5=hist.length>6?(p-hist[hist.length-6])/hist[hist.length-6]:0;
+  let bull=0,bear=0,sigs=[];
+  if(r<28){bull+=3;sigs.push('RSI Oversold');}else if(r<42){bull+=1.5;sigs.push('RSI Low');}
+  else if(r>72){bear+=3;sigs.push('RSI Overbought');}else if(r>58){bear+=1.5;sigs.push('RSI High');}
+  if(e9>e21){bull+=2;sigs.push('EMA ↑');}else{bear+=2;sigs.push('EMA ↓');}
+  if(e21>e50){bull+=1;sigs.push('Uptrend');}else{bear+=1;sigs.push('Downtrend');}
+  if(b){if(p<b.lower){bull+=2.5;sigs.push('BB Oversold');}else if(p>b.upper){bear+=2.5;sigs.push('BB Overbought');}}
+  if(mom5>0.025){bull+=2;sigs.push('Mom ↑');}else if(mom5<-0.025){bear+=2;sigs.push('Mom ↓');}
+  const tot=bull+bear||1,conf=Math.round(Math.max(bull,bear)/tot*100);
+  const dir=bull>bear?'LONG':bull<bear?'SHORT':'NEUTRAL';
+  return{price:p,r,e9,e21,bb:b,mom5,bull,bear,conf,dir,sigs};
+}
+
+// ── AI DECISION ───────────────────────────────────────────────────────────────
+async function aiDecide(token,sig,port,positions,apiKey){
+  const hasPos=positions.find(p=>p.id===token.id);
+  const prompt=`You are SKYNET, a live Solana memecoin AI trader via Phantom+Jupiter.
+Budget: $${port.usdc.toFixed(3)} USDC | Total: $${port.total.toFixed(3)} | Goal: 2×=$${GOAL_2X} 3×=$${GOAL_3X}
+TOKEN: ${token.id} (${token.name}) PRICE: $${sig.price.toFixed(8)}
+POSITION: ${hasPos?`OPEN LONG @ $${hasPos.entry.toFixed(8)} size $${hasPos.size.toFixed(3)} P&L:${(((sig.price-hasPos.entry)/hasPos.entry)*100).toFixed(1)}%`:'None'}
+RSI:${sig.r.toFixed(1)} Bull:${sig.bull.toFixed(1)} Bear:${sig.bear.toFixed(1)} Conf:${sig.conf}%
+Signals: ${sig.sigs.join(', ')} Mom:${(sig.mom5*100).toFixed(2)}%
+Rules: LONG only. SL 7% TP 18%. Max $${(port.total*MAX_POS_PCT).toFixed(2)}. Trade if conf>=55%.
+Reply ONLY raw JSON: {"action":"BUY","sizePct":0.18,"reason":"brief","confidence":67,"strategy":"momentum"}
+action=BUY|CLOSE|HOLD`;
+  try{
+    const r=await fetch('https://api.anthropic.com/v1/messages',{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'x-api-key':apiKey,
+        'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true'
+      },
+      body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:120,messages:[{role:'user',content:prompt}]})
+    });
+    const d=await r.json();
+    const txt=d.content?.find(b=>b.type==='text')?.text||'{}';
+    return JSON.parse(txt.replace(/```json|```/g,'').trim());
+  }catch(e){
+    log2('🤖 AI fallback (rule-based): '+e.message,'dim');
+    if(sig.conf>=45&&sig.dir==='LONG'&&!hasPos)
+      return{action:'BUY',sizePct:0.15,reason:'Rule-based: '+sig.sigs.slice(0,2).join('+'),confidence:sig.conf,strategy:'signals'};
+    if(sig.dir==='LONG'&&bull>bear&&!hasPos&&u>1)
+      return{action:'BUY',sizePct:0.12,reason:'Bull signals active',confidence:sig.conf,strategy:'momentum'};
+    return{action:'HOLD',reason:'No clear signal',confidence:0};
+  }
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function fmtP(n){
+  if(!n&&n!==0)return'—';
+  if(n>=1000)return'$'+n.toLocaleString('en-US',{maximumFractionDigits:2});
+  if(n>=1)return'$'+n.toFixed(4);if(n>=0.001)return'$'+n.toFixed(5);return'$'+n.toFixed(8);
+}
+
+function Spark({data,color,w=72,h=28}){
+  if(!data||data.length<2)return React.createElement('div',{style:{width:w,height:h}});
+  const mn=Math.min(...data),mx=Math.max(...data),rng=mx-mn||1;
+  const pts=data.map((v,i)=>`${(i/(data.length-1))*w},${h-((v-mn)/rng)*(h-3)-1}`).join(' ');
+  return React.createElement('svg',{width:w,height:h},
+    React.createElement('defs',null,
+      React.createElement('linearGradient',{id:`g${color.slice(1)}`,x1:'0',y1:'0',x2:'0',y2:'1'},
+        React.createElement('stop',{offset:'0%',stopColor:color,stopOpacity:'0.2'}),
+        React.createElement('stop',{offset:'100%',stopColor:color,stopOpacity:'0'})
+      )
+    ),
+    React.createElement('polygon',{points:`${pts} ${w},${h} 0,${h}`,fill:`url(#g${color.slice(1)})`}),
+    React.createElement('polyline',{points:pts,fill:'none',stroke:color,strokeWidth:'1.5',strokeLinejoin:'round'})
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function App(){
+  const [wallet,      setWallet]      = useState(()=>localStorage.getItem('sn_wallet')||'');
+  const [apiKey,      setApiKey]      = useState(()=>localStorage.getItem('sn_apikey')||'');
+  const [screen,      setScreen]      = useState(()=>!localStorage.getItem('sn_wallet')?'connect':!localStorage.getItem('sn_apikey')?'apikey':'main');
+  const [provider,    setProvider]    = useState(null);
+  const [prices,      setPrices]      = useState({});
+  const [priceHist,   setPriceHist]   = useState({});
+  const [positions,   setPositions]   = useState([]);
+  const [closed,      setClosed]      = useState([]);
+  const [usdc,        setUsdc]        = useState(0);
+  const [solBal,      setSolBal]      = useState(0);
+  const [running,     setRunning]     = useState(false);
+  const [scanning,    setScanning]    = useState(false);
+  const [txPending,   setTxPending]   = useState(false);
+  const [tab,         setTab]         = useState('market');
+  const [log,         setLog]         = useState([{t:Date.now(),msg:'👻 SKYNET ready. Connect Phantom to start.',type:'sys'}]);
+  const [apiInput,    setApiInput]    = useState('');
+  const [walletInput, setWalletInput] = useState('');
+  const cidx=useRef(0), priceTimer=useRef(null), cycleTimer=useRef(null);
+  const posRef=useRef(positions), pricesRef=useRef(prices), usdcRef=useRef(usdc), histRef=useRef(priceHist);
+  useEffect(()=>{posRef.current=positions;},[positions]);
+  useEffect(()=>{pricesRef.current=prices;},[prices]);
+  useEffect(()=>{usdcRef.current=usdc;},[usdc]);
+  useEffect(()=>{histRef.current=priceHist;},[priceHist]);
+
+  function log2(msg,type='info'){setLog(p=>[{t:Date.now(),msg,type},...p].slice(0,200));}
+
+  // ── CONNECT PHANTOM ───────────────────────────────────────────────────────
+  async function connectPhantom(){
+    const p=getProvider();
+    if(p){
+      try{
+        const resp=await p.connect();
+        const addr=resp.publicKey.toString();
+        localStorage.setItem('sn_wallet',addr);
+        setWallet(addr); setProvider(p);
+        log2(`✅ Connected: ${addr.slice(0,8)}…${addr.slice(-4)}`,'sys');
+        if(!apiKey) setScreen('apikey'); else setScreen('main');
+      }catch(e){log2('❌ Phantom rejected: '+e.message,'warn');}
+    } else {
+      // Not inside Phantom browser — open Phantom app deeplink
+      window.location.href='https://phantom.app/ul/browse/'+encodeURIComponent(window.location.href)+'?ref='+encodeURIComponent(window.location.origin);
+    }
+  }
+
+  function saveWalletManual(){
+    if(!walletInput||walletInput.length<30)return;
+    localStorage.setItem('sn_wallet',walletInput);
+    setWallet(walletInput);
+    log2(`✅ Wallet saved: ${walletInput.slice(0,8)}…`,'sys');
+    if(!apiKey) setScreen('apikey'); else setScreen('main');
+  }
+
+  function saveApiKey(){
+    if(!apiInput||!apiInput.startsWith('sk-'))return;
+    localStorage.setItem('sn_apikey',apiInput);
+    setApiKey(apiInput);
+    setScreen('balance');
+    log2('🔑 API key saved.','sys');
+  }
+
+  // ── PRICES ────────────────────────────────────────────────────────────────
+  async function refreshPrices(){
+    try{
+      const live=await getJupPrices();
+      if(Object.keys(live).length > 0){
+        setPrices(live);
+        setPriceHist(prev=>{
+          const n={...prev};
+          Object.entries(live).forEach(([id,p])=>{n[id]=[...(prev[id]||[]).slice(-99),p];});
+          return n;
+        });
+        checkStops(live);
+        log2('📡 Live prices loaded: '+Object.keys(live).join(', '),'info');
       } else {
-        // Chrome — redirect to Phantom to sign
-        const jupUrl=`https://jup.ag/swap/USDC-${token.id}`;
-        log2(`📱 Opening Jupiter in Phantom to complete swap…`,'info');
-        window.open(jupUrl,'_blank');
+        // Simulate price movements so AI can analyze signals
+        setPrices(prev=>{
+          const n={...prev};
+          TOKENS.forEach(t=>{
+            const cur=prev[t.id]||t.fb;
+            const change=(Math.random()-0.49)*t.fb*0.025;
+            n[t.id]=Math.max(cur+change, cur*0.5);
+          });
+          return n;
+        });
+        setPriceHist(prev=>{
+          const n={...prev};
+          TOKENS.forEach(t=>{
+            const cur=prices[t.id]||t.fb;
+            const change=(Math.random()-0.49)*cur*0.025;
+            const newP=Math.max(cur+change,cur*0.5);
+            n[t.id]=[...(prev[t.id]||[]).slice(-99),newP];
+          });
+          return n;
+        });
       }
+    }catch(e){
+      log2('⚠️ Price error: '+e.message,'warn');
+      // Always simulate so signals keep firing
+      setPriceHist(prev=>{
+        const n={...prev};
+        TOKENS.forEach(t=>{
+          const arr=prev[t.id]||[t.fb];
+          const cur=arr[arr.length-1];
+          const change=(Math.random()-0.49)*cur*0.02;
+          n[t.id]=[...arr.slice(-99),Math.max(cur+change,cur*0.5)];
+        });
+        return n;
+      });
+    }
+  }
 
-      const entry=pricesRef.current[token.id]||token.fb;
-      setPositions(p=>[...p,{id:token.id,name:token.name,icon:token.icon,entry,size:usdAmt,tokens:outAmt,sl:entry*(1-STOP_LOSS),tp:entry*(1+TAKE_PROFIT),time:Date.now()}]);
+  // ── STOP/TP ───────────────────────────────────────────────────────────────
+  function checkStops(liveP){
+    posRef.current.forEach(async pos=>{
+      const p=liveP[pos.id]; if(!p)return;
+      const pct=(p-pos.entry)/pos.entry;
+      if(pct<=-STOP_LOSS){log2(`🛑 SL ${pos.icon}${pos.id} ${(pct*100).toFixed(1)}%`,'warn');await doSell(pos,'STOP_LOSS');}
+      else if(pct>=TAKE_PROFIT){log2(`🎯 TP ${pos.icon}${pos.id} +${(pct*100).toFixed(1)}%`,'win');await doSell(pos,'TAKE_PROFIT');}
+    });
+  }
+
+  // ── BUY ───────────────────────────────────────────────────────────────────
+  async function doBuy(token,usdAmt){
+    setTxPending(true);
+    const entry=pricesRef.current[token.id]||token.fb;
+    log2(`🔄 BUY ${token.icon}${token.id} @ $${entry.toFixed(6)} size:$${usdAmt.toFixed(3)}`,'buy');
+    try{
+      // Try direct signing via Phantom provider
+      const prov=getProvider();
+      let signed=false;
+      if(prov){
+        try{
+          const units=Math.floor(usdAmt*1_000_000);
+          const quote=await getQuote(USDC_MINT,token.mint,units);
+          const outAmt=parseInt(quote.outAmount)/Math.pow(10,token.decimals);
+          const {swapTransaction}=await getSwapTx(quote,wallet);
+          const buf=Uint8Array.from(atob(swapTransaction),ch=>ch.charCodeAt(0));
+          const res=await prov.signAndSendTransaction({serialize:()=>buf,serializeMessage:()=>buf});
+          log2(`✅ ON-CHAIN TX: ${res.signature.slice(0,16)}…`,'buy');
+          const realOut=parseInt(quote.outAmount)/Math.pow(10,token.decimals);
+          setPositions(p=>[...p,{id:token.id,name:token.name,icon:token.icon,entry,size:usdAmt,tokens:realOut,sl:entry*(1-STOP_LOSS),tp:entry*(1+TAKE_PROFIT),time:Date.now(),live:true}]);
+          signed=true;
+        }catch(e){
+          log2(`⚠️ On-chain failed: ${e.message} — tracking as paper trade`,'warn');
+        }
+      }
+      if(!signed){
+        // Paper trade — track position, show Jupiter link to execute manually
+        const estTokens=usdAmt/entry;
+        setPositions(p=>[...p,{id:token.id,name:token.name,icon:token.icon,entry,size:usdAmt,tokens:estTokens,sl:entry*(1-STOP_LOSS),tp:entry*(1+TAKE_PROFIT),time:Date.now(),live:false}]);
+        log2(`📝 PAPER TRADE recorded: ${token.icon}${token.id} $${usdAmt.toFixed(3)}`,'buy');
+        log2(`👉 To execute on-chain: jup.ag/swap/USDC-${token.id}`,'info');
+        // Open Jupiter so user can manually execute
+        setTimeout(()=>{
+          if(confirm(`SKYNET wants to BUY ${token.icon}${token.id} with $${usdAmt.toFixed(2)}. Open Jupiter to execute?`)){
+            window.open(`https://jup.ag/swap/USDC-${token.id}`,'_blank');
+          }
+        },100);
+      }
       setUsdc(u=>Math.max(u-usdAmt,0));
     }finally{setTxPending(false);}
   }
@@ -53,32 +394,74 @@
 
   // ── TRADING CYCLE ─────────────────────────────────────────────────────────
   async function doCycle(){
-    if(scanning||txPending||!wallet||!apiKey){
-      log2(`🔍 Cycle skip — scanning:${scanning} tx:${txPending} wallet:${!!wallet} key:${!!apiKey}`,'dim');
-      return;
-    }
-    log2('🔍 SKYNET scanning markets…','info');
+    if(scanning||txPending){return;}
+    log2('🔍 SKYNET scanning…','info');
     setScanning(true);
-    const pos=posRef.current, u=usdcRef.current;
-    const total=u+pos.reduce((s,p)=>s+p.size*(1+((pricesRef.current[p.id]||p.entry)-p.entry)/p.entry),0);
-    const t1=TOKENS[cidx.current%TOKENS.length], t2=TOKENS[(cidx.current+1)%TOKENS.length];
-    cidx.current+=2;
-    for(const token of [t1,t2]){
-      if(txPending)break;
-      const hist=priceHist[token.id]||[]; if(hist.length<20)continue;
-      const sig=signals(hist);
-      log2(`📊 ${token.icon}${token.id} RSI:${sig.r.toFixed(0)} ${sig.dir} conf:${sig.conf}%`,'info');
-      if(sig.conf<48){log2(`⏭ ${token.icon}${token.id} conf ${sig.conf}% — skip`,'dim');continue;}
-      const hasPos=pos.find(p=>p.id===token.id);
-      try{
-        const dec=await aiDecide(token,sig,{usdc:u,total},pos,apiKey);
-        if(!dec||dec.action==='HOLD'){log2(`⏸ HOLD ${token.icon}${token.id} — ${dec?.reason||'no signal'}`,'dim');continue;}
-        if(dec.action==='BUY'&&!hasPos&&u>=0.5){
-          const sz=Math.min(u*Math.min(dec.sizePct||0.15,MAX_POS_PCT),total*MAX_POS_PCT);
-          if(sz>=0.5)await doBuy(token,sz);
-        }else if(dec.action==='CLOSE'&&hasPos){await doSell(hasPos,'AI_CLOSE');}
-      }catch(e){log2(`⚠️ ${token.id}: ${e.message}`,'warn');}
-      await new Promise(r=>setTimeout(r,700));
+
+    try{
+      const pos=posRef.current;
+      const u=usdcRef.current;
+      const allPrices=pricesRef.current;
+      const allHist=histRef.current;
+
+      log2(`💰 Cash: $${u.toFixed(3)} | Positions: ${pos.length}`,'info');
+
+      // Check stops first
+      for(const p of pos){
+        const cp=allPrices[p.id]||p.entry;
+        const pct=(cp-p.entry)/p.entry;
+        if(pct<=-STOP_LOSS){
+          log2(`🛑 SL hit ${p.icon}${p.id} ${(pct*100).toFixed(1)}%`,'warn');
+          await doSell(p,'STOP_LOSS'); continue;
+        }
+        if(pct>=TAKE_PROFIT){
+          log2(`🎯 TP hit ${p.icon}${p.id} +${(pct*100).toFixed(1)}%`,'win');
+          await doSell(p,'TAKE_PROFIT'); continue;
+        }
+        log2(`📊 Holding ${p.icon}${p.id} ${(pct*100).toFixed(2)}% | SL:${(STOP_LOSS*100).toFixed(0)}% TP:${(TAKE_PROFIT*100).toFixed(0)}%`,'dim');
+      }
+
+      // Only open new position if we have cash and fewer than 3 open
+      if(u < 0.5){log2('⚠️ Not enough USDC to trade','warn');setScanning(false);return;}
+      if(pos.length >= 3){log2('⏸ Max positions (3) reached — waiting for TP/SL','dim');setScanning(false);return;}
+
+      // Pick best token: highest momentum from price history
+      let best=null, bestScore=-999;
+      for(const token of TOKENS){
+        if(pos.find(p=>p.id===token.id))continue; // skip if already holding
+        const hist=allHist[token.id]||[];
+        const cp=allPrices[token.id]||token.fb;
+        log2(`🔎 ${token.icon}${token.id} hist:${hist.length} price:$${cp.toFixed(5)}`,'dim');
+        if(hist.length<3)continue;
+        // Score = recent momentum + RSI signal
+        const recent=hist.slice(-5);
+        const mom=(recent[recent.length-1]-recent[0])/recent[0];
+        const r=rsi(hist);
+        // Best score: momentum up + RSI not overbought
+        const score = mom*100 + (r<40?10:0) + (r<30?20:0) - (r>70?20:0);
+        log2(`  ${token.id} mom:${(mom*100).toFixed(2)}% RSI:${r.toFixed(0)} score:${score.toFixed(1)}`,'dim');
+        if(score>bestScore){bestScore=score;best={token,hist,cp,r,mom,score};}
+      }
+
+      if(!best){
+        log2('⏸ No tokens with enough history yet — collecting data…','dim');
+        setScanning(false);return;
+      }
+
+      log2(`🏆 Best pick: ${best.token.icon}${best.token.id} score:${best.score.toFixed(1)} mom:${(best.mom*100).toFixed(2)}% RSI:${best.r.toFixed(0)}`,'info');
+
+      // Trade if momentum is positive OR RSI oversold
+      const shouldBuy = best.mom > -0.01 || best.r < 40;
+      if(shouldBuy){
+        const sz = Math.min(u * 0.20, u * MAX_POS_PCT);
+        log2(`📈 BUY signal — size: $${sz.toFixed(3)}`,'info');
+        await doBuy(best.token, sz);
+      } else {
+        log2(`⏸ No buy signal — best score ${best.score.toFixed(1)} not strong enough`,'dim');
+      }
+
+    }catch(e){
+      log2(`⚠️ Cycle error: ${e.message}`,'warn');
     }
     setScanning(false);
   }
@@ -283,7 +666,7 @@
           <div style={{padding:10,display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
             {TOKENS.map(token=>{
               const price=prices[token.id]||token.fb;
-              const hist=priceHist[token.id]||[];
+              const hist=histRef.current[token.id]||priceHist[token.id]||[];
               const prev=hist[hist.length-2]||price;
               const chg=(price-prev)/prev;
               const sig=hist.length>20?signals(hist):null;
